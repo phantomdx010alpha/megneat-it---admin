@@ -1,0 +1,59 @@
+-- 0004_project_connection_strings.sql
+--
+-- ADMIN_PANEL_SCHEMA_BROADCAST_MASTERPLAN.md, Phase 1: store what's needed
+-- to reach every active project's Postgres on demand, without re-asking the
+-- operator for a connection string every time a schema change needs to go
+-- out. See that masterplan's own "Background" section for why this is a
+-- real, new class of stored secret and not a small thing to wave through.
+--
+-- ── The decision this migration makes, made plainly ────────────────────────
+-- Column-level encryption (e.g. pgcrypto's pgp_sym_encrypt/pgp_sym_decrypt)
+-- was considered and deliberately NOT used here. Reasoning:
+--
+--   1. This table already stores an equally sensitive secret in plaintext —
+--      `supabase_service_role_key` (0002_registry_schema.sql) is a master
+--      key to each entire target project, no less powerful than a direct
+--      Postgres connection string. Encrypting only the new column would be
+--      a false sense of added safety while the existing column, with an
+--      equal or greater blast radius, stays plaintext right next to it.
+--   2. pgcrypto encryption requires a symmetric key that must live
+--      *outside* this database (an env var, e.g.) and be passed into every
+--      encrypt/decrypt call. For a single-operator internal tool where the
+--      actual security boundary is already `requireAdminUser()` at the top
+--      of every server action (see lib/supabase/admin.js's own comment on
+--      this same tradeoff for the service-role key), this adds real
+--      complexity — a key to provision, rotate, and never lose — without
+--      changing who can actually reach the plaintext value day to day: any
+--      code path with a legitimate reason to run DDL against a target
+--      project needs the decrypted string anyway, so it is only ever "at
+--      rest in the registry's own DB" that encryption would help, and the
+--      registry DB access is already gated the same way the service-role
+--      key's access is.
+--   3. Supabase/Postgres does not offer transparent column encryption out
+--      of the box the way e.g. a KMS-backed column would — "practical to
+--      set up here" (the masterplan's own phrasing) would mean bolting on
+--      pgcrypto plus a key-management story for one column, which is a
+--      disproportionate amount of new infrastructure for what is currently
+--      a 4-5 project, single-operator registry.
+--
+-- This is written down here, explicitly, rather than skipped past, per the
+-- masterplan's own instruction not to silently omit this decision. If this
+-- registry ever grows beyond a single trusted operator, or the target
+-- projects' stakes rise significantly, this tradeoff should be revisited —
+-- flagging that explicitly too, rather than treating "we decided against it
+-- once" as permanent.
+--
+-- `db_connection_string` holds the same kind of value the "Add project"
+-- form already asks for at provisioning time (Settings → Database in the
+-- target project) — the direct Postgres connection string, including the
+-- DB password. Nullable: existing rows (and any project added without
+-- provisioning up front) won't have one until either the create form or
+-- the backfill prompt (app/(app)/projects/page.js) supplies it.
+
+alter table public.projects
+  add column if not exists db_connection_string text;
+
+-- No RLS change needed, same reasoning as 0003_project_status.sql: the
+-- existing "authenticated_full_access_projects" policy (for all,
+-- using (true)) already covers this new column for the one admin session,
+-- and anon still has zero access to `projects` at all.

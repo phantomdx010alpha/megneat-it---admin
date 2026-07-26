@@ -1,0 +1,203 @@
+/*
+ * styles/tokens.css — THE ONLY PLACE for colors, shadows, radii, typography.
+ * Changing ONE value here reskins the entire app. No component-level overrides.
+ *
+ * Neumorphic system: soft dual-shadow depth on a warm slate surface.
+ * Accent: teal-green (#0F9B8E). Not purple. Not indigo.
+ */
+
+:root {
+  /* ─── Surface ─────────────────────────────────────────────── */
+  --surface:         #E8EDF2;   /* base neumorphic background */
+  --surface-raised:  #EEF2F7;   /* slightly lighter inset inverse */
+  --surface-inset:   #DDE3EB;   /* slightly darker for pressed states */
+
+  /* ─── Neumorphic dual shadows ─────────────────────────────── */
+  --shadow-light:    #FFFFFF;            /* highlight shadow (top-left) */
+  --shadow-dark:     #C8D0DA;            /* depth shadow (bottom-right) */
+  --shadow-distance: 6px;               /* how far shadows offset */
+  --shadow-blur:     12px;              /* softness of the neumorphic blur */
+
+  /* Compound shadow shorthands — use these in components */
+  --shadow-raised:
+    calc(-1 * var(--shadow-distance)) calc(-1 * var(--shadow-distance)) var(--shadow-blur) var(--shadow-light),
+    var(--shadow-distance) var(--shadow-distance) var(--shadow-blur) var(--shadow-dark);
+
+  --shadow-inset:
+    inset calc(-1 * var(--shadow-distance)) calc(-1 * var(--shadow-distance)) var(--shadow-blur) var(--shadow-light),
+    inset var(--shadow-distance) var(--shadow-distance) var(--shadow-blur) var(--shadow-dark);
+
+  --shadow-flat:
+    -2px -2px 5px var(--shadow-light),
+    2px 2px 5px var(--shadow-dark);
+
+  /* ─── Accent (teal-green — intentional, not purple/indigo) ── */
+  --accent:          #0F9B8E;
+  --accent-hover:    #0D8A7E;
+  --accent-active:   #0B7A6F;
+  --accent-muted:    rgba(15, 155, 142, 0.12);
+  --accent-contrast: #FFFFFF;   /* text on accent backgrounds */
+
+  /* ─── Status / semantic colors ────────────────────────────── */
+  --color-danger:    #D94F4F;
+  --color-warning:   #C48A00;
+  --color-success:   #2D9B6A;
+  --color-info:      #2B7FBF;
+
+  /* ─── Typography colors ───────────────────────────────────── */
+  --text-primary:    #1F2733;
+  --text-secondary:  #4A5568;
+  --text-muted:      #8A96A3;
+  --text-disabled:   #B8C0CA;
+  --text-on-accent:  #FFFFFF;
+
+  /* ─── Typography scale ────────────────────────────────────── */
+  --font-family:          'Inter', system-ui, -apple-system, sans-serif;
+  --font-family-mono:     'JetBrains Mono', 'Fira Code', monospace;
+
+  --font-size-xs:    0.6875rem;  /* 11px */
+  --font-size-sm:    0.8125rem;  /* 13px */
+  --font-size-base:  0.9375rem;  /* 15px */
+  --font-size-md:    1.0625rem;  /* 17px */
+  --font-size-lg:    1.25rem;    /* 20px */
+  --font-size-xl:    1.5rem;     /* 24px */
+  --font-size-2xl:   2rem;       /* 32px */
+
+  --font-weight-regular:  400;
+  --font-weight-medium:   500;
+  --font-weight-semibold: 600;
+  --font-weight-bold:     700;
+
+  --line-height-tight:  1.25;
+  --line-height-base:   1.5;
+  --line-height-loose:  1.75;
+
+  --letter-spacing-tight: -0.02em;
+  --letter-spacing-base:   0em;
+  --letter-spacing-wide:   0.04em;
+  --letter-spacing-wider:  0.08em;
+
+  /* ─── Spacing scale ───────────────────────────────────────── */
+  --space-1:   0.25rem;    /* 4px */
+  --space-2:   0.5rem;     /* 8px */
+  --space-3:   0.75rem;    /* 12px */
+  --space-4:   1rem;       /* 16px */
+  --space-5:   1.25rem;    /* 20px */
+  --space-6:   1.5rem;     /* 24px */
+  --space-8:   2rem;       /* 32px */
+  --space-10:  2.5rem;     /* 40px */
+  --space-12:  3rem;       /* 48px */
+  --space-16:  4rem;       /* 64px */
+
+  /* ─── Border radius ───────────────────────────────────────── */
+  --radius-sm:   8px;
+  --radius:      12px;
+  --radius-md:   16px;
+  --radius-lg:   20px;
+  --radius-xl:   28px;
+  --radius-full: 9999px;
+
+  /* ─── Border ──────────────────────────────────────────────── */
+  --border-color:       rgba(0, 0, 0, 0.06);
+  --border-color-focus: var(--accent);
+
+  /* ─── Overlay ─────────────────────────────────────────────── */
+  /* Phase 77: extracted so BottomSheet.jsx's backdrop (previously a
+     hardcoded rgba(31,39,51,0.45)) is token-driven like everything else.
+     Value preserved exactly, just named — no visual change. */
+  --overlay-backdrop:   rgba(31, 39, 51, 0.45);
+
+  /* ─── Motion ──────────────────────────────────────────────── */
+  --transition-fast:   100ms ease;
+  --transition-base:   180ms ease;
+  --transition-slow:   320ms ease;
+
+  /* ─── Z-index scale ───────────────────────────────────────── */
+  --z-below:    -1;
+  --z-base:      0;
+  --z-raised:   10;
+  --z-nav:      20;
+  --z-overlay:  30;
+  --z-modal:    40;
+  --z-toast:    50;
+
+  /* ─── Layout ──────────────────────────────────────────────── */
+  --nav-bottom-height:  64px;    /* bottom tab bar height (mobile) */
+  --nav-rail-width:     220px;   /* side rail width (desktop) */
+  --content-max-width:  1200px;
+  --page-padding-x:     var(--space-4);
+  --page-padding-y:     var(--space-6);
+}
+
+/* ─── Global base resets ────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-family);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background-color: var(--surface);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--surface);
+  color: var(--text-primary);
+  line-height: var(--line-height-base);
+}
+
+/* ─── Neumorphic utility classes (use via className, not inline) */
+.neu-raised {
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-raised);
+}
+
+.neu-inset {
+  background: var(--surface-inset);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-inset);
+}
+
+.neu-flat {
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-flat);
+}
+
+/* ─── Neumorphic pulse animation for LoadingState ────────────── */
+@keyframes neu-pulse {
+  0%, 100% {
+    box-shadow:
+      calc(-1 * var(--shadow-distance)) calc(-1 * var(--shadow-distance)) var(--shadow-blur) var(--shadow-light),
+      var(--shadow-distance) var(--shadow-distance) var(--shadow-blur) var(--shadow-dark);
+    opacity: 1;
+  }
+  50% {
+    box-shadow:
+      -2px -2px 4px var(--shadow-light),
+      2px 2px 4px var(--shadow-dark);
+    opacity: 0.6;
+  }
+}
+
+.neu-pulse {
+  animation: neu-pulse 1.6s ease-in-out infinite;
+}
+
+/* ─── Reduced motion ─────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .neu-pulse {
+    animation: none;
+    opacity: 0.7;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
