@@ -1,0 +1,969 @@
+-- ============================================================
+-- M@GNEAT IT — Complete Supabase Setup (Fresh Project)
+-- Run this ONCE in Supabase SQL Editor (role: postgres).
+-- This replaces ALL individual migration files.
+-- ============================================================
+
+
+-- ============================================================
+-- SECTION 1: LICENSES
+-- ============================================================
+
+create table if not exists licenses (
+  license_key  text        primary key,
+  company_name text,
+  is_active    boolean     default true,
+  max_devices  integer     default 5,
+  created_at   timestamptz default now(),
+  expires_at   timestamptz
+);
+
+alter table licenses enable row level security;
+-- Service role bypasses RLS (shell uses this). No policy needed for licenses.
+
+-- ── Insert your license key here ──
+insert into licenses (license_key, company_name, max_devices)
+values ('TEST-LIC-0001-VALID', 'My Company', 5)
+on conflict (license_key) do nothing;
+
+
+-- ============================================================
+-- SECTION 2: DEVICE REGISTRATIONS
+-- ============================================================
+
+create table if not exists device_registrations (
+  id            uuid        primary key default gen_random_uuid(),
+  license_key   text        not null,
+  device_id     text        not null,
+  device_name   text,
+  registered_at timestamptz default now(),
+  last_seen_at  timestamptz,
+  is_active     boolean     default true,
+  is_master     boolean     not null default false,
+  can_write     boolean     not null default false,
+  unique(device_id)
+);
+
+alter table device_registrations enable row level security;
+
+create policy "users_can_register_own_devices"
+  on device_registrations for all to authenticated
+  using (license_key = (auth.jwt()->'user_metadata'->>'license_key'))
+  with check (license_key = (auth.jwt()->'user_metadata'->>'license_key'));
+
+
+-- ============================================================
+-- SECTION 3: SYNC QUEUE (multi-device postbox)
+-- ============================================================
+
+create table if not exists sync_queue (
+  id           uuid        primary key default gen_random_uuid(),
+  license_key  text        not null,
+  device_id    text,                    -- target device (required in multi-device mode)
+  table_name   text        not null,
+  chunk_index  integer     not null,
+  total_chunks integer     not null,
+  payload      jsonb       not null,
+  pushed_at    timestamptz default now(),
+  acked_by     text[]      default '{}',
+  required_acks text[]     not null default '{}'
+);
+
+alter table sync_queue enable row level security;
+
+create policy "authenticated_full_access" on sync_queue
+  for all to authenticated using (true) with check (true);
+
+-- Index for fast per-device polling
+create index if not exists idx_sync_queue_device
+  on sync_queue(device_id, license_key);
+
+-- Auto-delete trigger: when all required devices have acked, delete the row
+create or replace function delete_fully_acked_chunk()
+returns trigger language plpgsql as $$
+begin
+  if new.required_acks <@ new.acked_by then
+    delete from sync_queue where id = new.id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_ack_cleanup on sync_queue;
+create trigger trg_ack_cleanup
+  after update of acked_by on sync_queue
+  for each row execute function delete_fully_acked_chunk();
+
+
+-- ============================================================
+-- SECTION 4: INITIAL SYNC REQUESTS
+-- ============================================================
+
+create table if not exists initial_sync_requests (
+  id           uuid        primary key default gen_random_uuid(),
+  license_key  text        not null,
+  device_id    text        not null,
+  from_date    date,                    -- financial year start (e.g. 2024-04-01)
+  to_date      date,                    -- financial year end or today
+  requested_at timestamptz default now(),
+  status       text        default 'pending',  -- pending | in_progress | completed | failed
+  started_at   timestamptz,
+  completed_at timestamptz
+);
+
+alter table initial_sync_requests enable row level security;
+
+create policy "authenticated_full_access" on initial_sync_requests
+  for all to authenticated using (true) with check (true);
+
+create index if not exists idx_initial_sync_requests_status
+  on initial_sync_requests(license_key, status);
+
+-- Hard guarantee against duplicate in-flight requests for the same device.
+-- The PWA already checks for an existing pending/processing row before
+-- inserting (lib/data/sync.js requestInitialSync), but that check has a
+-- small race window — two near-simultaneous calls could both pass it before
+-- either insert lands. This index is the actual guarantee: a second insert
+-- while one is still pending/processing fails with 23505 (unique_violation),
+-- which the PWA catches and treats as "already in flight, nothing to do."
+-- Without this, duplicate rows would each independently trigger the shell to
+-- run a full Tally pull + full postbox push for the same device — wasteful
+-- and pointless since the first one already covers it.
+create unique index if not exists one_pending_initial_sync_per_device
+  on initial_sync_requests (license_key, device_id)
+  where status in ('pending', 'processing');
+
+
+-- ============================================================
+-- SECTION 5: DELTA SYNC REQUESTS
+-- ============================================================
+
+create table if not exists delta_sync_requests (
+  id            uuid        primary key default gen_random_uuid(),
+  license_key   text        not null,
+  device_id     text        not null,
+  last_sync_at  timestamptz not null,   -- device's last known sync timestamp
+  lookback_days integer     default 4,  -- shell calculates: from = last_sync_at - lookback_days
+  requested_at  timestamptz default now(),
+  status        text        default 'pending'  -- pending | processing | completed | failed
+);
+
+alter table delta_sync_requests enable row level security;
+
+create policy "device_can_manage_own_delta_requests"
+  on delta_sync_requests for all to authenticated
+  using (license_key = (auth.jwt()->'user_metadata'->>'license_key'))
+  with check (license_key = (auth.jwt()->'user_metadata'->>'license_key'));
+
+create index if not exists idx_delta_sync_requests_status
+  on delta_sync_requests(license_key, status);
+
+-- Same hard guarantee as initial_sync_requests above — prevents duplicate
+-- in-flight delta requests for the same device. More relevant here since
+-- delta can be triggered from three independent places on the PWA side
+-- (auto-interval timer, window 'online' event, manual button) that could
+-- plausibly fire close together.
+create unique index if not exists one_pending_delta_sync_per_device
+  on delta_sync_requests (license_key, device_id)
+  where status in ('pending', 'processing');
+
+
+-- ============================================================
+-- SECTION 6: DEVICE SYNC STATE
+-- ============================================================
+
+create table if not exists device_sync_state (
+  device_id    text not null,
+  table_name   text not null,
+  last_pulled_at timestamptz,
+  row_count    bigint,
+  primary key (device_id, table_name)
+);
+
+alter table device_sync_state enable row level security;
+
+create policy "authenticated_full_access" on device_sync_state
+  for all to authenticated using (true) with check (true);
+
+
+-- ============================================================
+-- SECTION 7: SYNC COMMANDS (for future remote sync from PWA)
+-- ============================================================
+
+create table if not exists sync_commands (
+  id                  uuid        primary key default gen_random_uuid(),
+  license_key         text        not null,
+  issued_by_device_id text        not null,
+  command             text        not null,
+  lookback_days       integer     not null,
+  status              text        default 'pending',
+  issued_at           timestamptz default now(),
+  picked_up_at        timestamptz,
+  completed_at        timestamptz,
+  error_message       text
+);
+
+alter table sync_commands enable row level security;
+
+create policy "authenticated_full_access" on sync_commands
+  for all to authenticated using (true) with check (true);
+
+
+-- ============================================================
+-- SECTION 8: TALLY MASTER TABLES
+-- ============================================================
+
+create table if not exists mst_group (
+    guid text primary key,
+    name text,
+    parent text,
+    is_revenue integer,
+    is_deemed_positive integer,
+    affects_gross_profit integer,
+    sort_position integer
+);
+alter table mst_group enable row level security;
+create policy "authenticated_full_access" on mst_group
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_currency (
+    guid text primary key,
+    name text,
+    formal_name text
+);
+alter table mst_currency enable row level security;
+create policy "authenticated_full_access" on mst_currency
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_voucher_type (
+    guid text primary key,
+    name text,
+    parent text,
+    numbering_method text,
+    is_optional integer,
+    is_active integer,
+    use_zero_entries integer,
+    common_narration integer,
+    effect_stock integer,
+    core_voucher_type text,
+    as_mfg_jrnl integer,
+    alias text,
+    use_for_jobwork integer,
+    is_for_jobwork_in integer,
+    print_after_save integer,
+    use_for_pos_invoice integer,
+    vch_print_bank_name text,
+    vch_print_title text,
+    tax_unit_name text,
+    vch_print_jurisdiction text,
+    multi_narration integer,
+    is_default_allocation_enabled integer,
+    default_voucher_category text,
+    can_delete integer
+);
+alter table mst_voucher_type enable row level security;
+create policy "authenticated_full_access" on mst_voucher_type
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_cost_category (
+    guid text primary key,
+    name text,
+    allocate_revenue integer,
+    allocate_non_revenue integer,
+    alias text
+);
+alter table mst_cost_category enable row level security;
+create policy "authenticated_full_access" on mst_cost_category
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_cost_centre (
+    guid text primary key,
+    name text,
+    parent text,
+    category text,
+    email text,
+    show_opening_bal integer,
+    alias text
+);
+alter table mst_cost_centre enable row level security;
+create policy "authenticated_full_access" on mst_cost_centre
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_unit (
+    guid text primary key,
+    name text,
+    formal_name text,
+    is_simple_unit integer,
+    base_unit text,
+    additional_units text,
+    conversion numeric,
+    decimal_places integer
+);
+alter table mst_unit enable row level security;
+create policy "authenticated_full_access" on mst_unit
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_group (
+    guid text primary key,
+    name text,
+    parent text,
+    is_addable integer,
+    alias text,
+    gst_applicability text,
+    base_unit text
+);
+alter table mst_stock_group enable row level security;
+create policy "authenticated_full_access" on mst_stock_group
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_category (
+    guid text primary key,
+    name text,
+    parent text,
+    alias text
+);
+alter table mst_stock_category enable row level security;
+create policy "authenticated_full_access" on mst_stock_category
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_godown (
+    guid text primary key,
+    name text,
+    alias text
+);
+alter table mst_godown enable row level security;
+create policy "authenticated_full_access" on mst_godown
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_gst_registration (
+    guid text primary key,
+    gstin text,
+    state_name text,
+    registration_type text,
+    applicable_from text,
+    prior_state_name text,
+    eway_applicable_type text,
+    gst_username text,
+    is_other_territory integer,
+    is_eway_bill_applicable integer,
+    alias text,
+    esign_method text,
+    is_eway_bill_applicable_for_intra integer
+);
+alter table mst_gst_registration enable row level security;
+create policy "authenticated_full_access" on mst_gst_registration
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_company (
+    guid text primary key,
+    name text,
+    comp_num text,
+    starting_from text,
+    end_date text,
+    is_group_company integer
+);
+alter table mst_company enable row level security;
+create policy "authenticated_full_access" on mst_company
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_employee (
+    guid text primary key,
+    name text,
+    parent text,
+    category text,
+    email text,
+    show_opening_bal integer
+);
+alter table mst_employee enable row level security;
+create policy "authenticated_full_access" on mst_employee
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_employee_group (
+    guid text primary key,
+    name text,
+    parent text,
+    category text,
+    email text,
+    show_opening_bal integer
+);
+alter table mst_employee_group enable row level security;
+create policy "authenticated_full_access" on mst_employee_group
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+
+-- ============================================================
+-- SECTION 9: MST_LEDGER + SUB-TABLES
+-- ============================================================
+
+create table if not exists mst_ledger (
+    guid text primary key,
+    name text,
+    parent text,
+    alias text,
+    opening_balance numeric,
+    currency text,
+    tax_type text,
+    gst_type text,
+    pan_number text,
+    email text,
+    website text,
+    bank_name text,
+    account_number text,
+    credit_limit text,
+    is_bill_wise integer,
+    email_cc text,
+    ifsc_code text,
+    swift_code text,
+    bank_bsr_code text,
+    branch_name text,
+    rate_of_tax numeric,
+    gst_type_of_supply text,
+    phone_number text,
+    mobile_no text,
+    updated_at text,
+    is_cost_centres_on integer,
+    is_interest_on integer,
+    is_credit_check integer,
+    appropriate_for text
+);
+alter table mst_ledger enable row level security;
+create policy "authenticated_full_access" on mst_ledger
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_mailing_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    mailing_name text,
+    applicable_from text,
+    country text,
+    state text,
+    pin_code text,
+    address_lines text
+);
+alter table mst_ledger_mailing_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_mailing_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_addresses (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    address_name text,
+    country text,
+    state text,
+    pin_code text,
+    contact_person text,
+    mobile_no text,
+    phone_number text,
+    fax_number text,
+    email text,
+    pan_number text,
+    vat_number text,
+    cst_number text,
+    gstin text,
+    gst_dealer_type text,
+    is_other_territory integer,
+    address_lines text,
+    excise_nature_of_purchase text,
+    excise_registration_no text,
+    excise_import_registration_no text,
+    import_export_code text
+);
+alter table mst_ledger_addresses enable row level security;
+create policy "authenticated_full_access" on mst_ledger_addresses
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_payment_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    bank_name text,
+    city text,
+    transaction_type text,
+    in_favour text,
+    transaction_name text,
+    bank_account_no text,
+    bank_branch text,
+    ifsc text,
+    set_as_default integer,
+    cheque_cross_comment text
+);
+alter table mst_ledger_payment_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_payment_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_gst_reg_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    applicable_from text,
+    registration_type text,
+    state text,
+    place_of_supply text,
+    is_other_territory integer,
+    gstin text,
+    consider_purchase_for_export integer,
+    is_transporter integer,
+    transporter_id text,
+    is_common_party integer
+);
+alter table mst_ledger_gst_reg_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_gst_reg_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_gst_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    applicable_from text,
+    calculation_type text,
+    nature_of_transaction text,
+    taxability text,
+    source_of_gst_details text,
+    is_non_gst_goods integer,
+    is_reverse_charge integer,
+    is_ineligible_itc integer,
+    calculate_slab_on_mrp integer,
+    include_exp_for_slab_calc integer
+);
+alter table mst_ledger_gst_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_gst_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_hsn_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    applicable_from text,
+    hsn_code text,
+    hsn_description text,
+    hsn_classification text,
+    source text
+);
+alter table mst_ledger_hsn_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_hsn_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_contact_details (
+    id bigserial primary key,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    country_iso text,
+    name text,
+    phone_number text,
+    is_default_whatsapp boolean
+);
+alter table mst_ledger_contact_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_contact_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_gst_statewise_details (
+    id bigserial primary key,
+    gst_detail_id bigint references mst_ledger_gst_details(id) on delete cascade,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    state_name text,
+    duty_head text,
+    valuation_type text,
+    gst_rate numeric
+);
+alter table mst_ledger_gst_statewise_details enable row level security;
+create policy "authenticated_full_access" on mst_ledger_gst_statewise_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_ledger_address_excise_jurisdictions (
+    id bigserial primary key,
+    address_id bigint references mst_ledger_addresses(id) on delete cascade,
+    ledger_guid text references mst_ledger(guid) on delete cascade,
+    applicable_from text,
+    range text,
+    division text,
+    commissionerate text
+);
+alter table mst_ledger_address_excise_jurisdictions enable row level security;
+create policy "authenticated_full_access" on mst_ledger_address_excise_jurisdictions
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+
+-- ============================================================
+-- SECTION 10: MST_STOCK_ITEM + SUB-TABLES
+-- ============================================================
+
+create table if not exists mst_stock_item (
+    guid text primary key,
+    name text,
+    stock_group text,
+    stock_category text,
+    base_unit text,
+    additional_units text,
+    opening_qty numeric,
+    opening_rate numeric,
+    opening_value numeric,
+    gst_applicable text,
+    hsn_code text,
+    gst_type_of_supply text,
+    tcs_applicable text,
+    description text,
+    costing_method text,
+    valuation_method text,
+    use_expiry_dates integer,
+    track_mfg_date integer,
+    alias text,
+    narration text,
+    is_cost_tracking integer,
+    is_cost_centres_on integer,
+    maintain_in_branches integer,
+    inclusive_of_tax integer,
+    denominator numeric,
+    conversion numeric,
+    rate_of_duty text
+);
+alter table mst_stock_item enable row level security;
+create policy "authenticated_full_access" on mst_stock_item
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_hsn_details (
+    id bigserial primary key,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    applicable_from text,
+    hsn_code text,
+    hsn_description text,
+    hsn_classification text,
+    source text
+);
+alter table mst_stock_item_hsn_details enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_hsn_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_gst_details (
+    id bigserial primary key,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    applicable_from text,
+    calculation_type text,
+    nature_of_transaction text,
+    taxability text,
+    source_of_gst_details text,
+    is_non_gst_goods integer,
+    is_reverse_charge integer,
+    is_ineligible_itc integer,
+    calculate_slab_on_mrp integer,
+    include_exp_for_slab_calc integer
+);
+alter table mst_stock_item_gst_details enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_gst_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_gst_statewise_details (
+    id bigserial primary key,
+    gst_detail_id bigint references mst_stock_item_gst_details(id) on delete cascade,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    state_name text,
+    duty_head text,
+    valuation_type text,
+    gst_rate numeric
+);
+alter table mst_stock_item_gst_statewise_details enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_gst_statewise_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_opening_batches (
+    id bigserial primary key,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    batch_name text,
+    godown_name text,
+    quantity numeric,
+    rate numeric,
+    value numeric,
+    manufactured_on text
+);
+alter table mst_stock_item_opening_batches enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_opening_batches
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_components (
+    id bigserial primary key,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    component_name text,
+    base_qty numeric
+);
+alter table mst_stock_item_components enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_components
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_item_component_items (
+    id bigserial primary key,
+    component_id bigint references mst_stock_item_components(id) on delete cascade,
+    stock_item_guid text references mst_stock_item(guid) on delete cascade,
+    nature_of_component text,
+    item_name text,
+    default_godown text,
+    actual_qty numeric
+);
+alter table mst_stock_item_component_items enable row level security;
+create policy "authenticated_full_access" on mst_stock_item_component_items
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_group_gst_details (
+    id bigserial primary key,
+    stock_group_guid text references mst_stock_group(guid) on delete cascade,
+    applicable_from text,
+    calculation_type text,
+    nature_of_transaction text,
+    taxability text,
+    source_of_gst_details text,
+    is_non_gst_goods integer,
+    is_reverse_charge integer,
+    is_ineligible_itc integer,
+    calculate_slab_on_mrp integer,
+    include_exp_for_slab_calc integer
+);
+alter table mst_stock_group_gst_details enable row level security;
+create policy "authenticated_full_access" on mst_stock_group_gst_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_stock_group_gst_statewise_details (
+    id bigserial primary key,
+    gst_detail_id bigint references mst_stock_group_gst_details(id) on delete cascade,
+    stock_group_guid text references mst_stock_group(guid) on delete cascade,
+    state_name text,
+    duty_head text,
+    valuation_type text,
+    gst_rate numeric
+);
+alter table mst_stock_group_gst_statewise_details enable row level security;
+create policy "authenticated_full_access" on mst_stock_group_gst_statewise_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+
+-- ============================================================
+-- SECTION 11: VOUCHER TYPE SUB-TABLES + GST REGISTRATION
+-- ============================================================
+
+create table if not exists mst_voucher_type_classes (
+    id bigserial primary key,
+    voucher_type_guid text references mst_voucher_type(guid) on delete cascade,
+    class_name text
+);
+alter table mst_voucher_type_classes enable row level security;
+create policy "authenticated_full_access" on mst_voucher_type_classes
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists mst_gst_registration_details (
+    id bigserial primary key,
+    gst_reg_guid text references mst_gst_registration(guid) on delete cascade,
+    applicable_from text,
+    registration_type text,
+    state text,
+    place_of_supply text,
+    is_other_territory integer,
+    is_state_cess_on integer
+);
+alter table mst_gst_registration_details enable row level security;
+create policy "authenticated_full_access" on mst_gst_registration_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+
+-- ============================================================
+-- SECTION 12: TRN_VOUCHER + SUB-TABLES
+-- ============================================================
+
+create table if not exists trn_voucher (
+    guid text primary key,
+    date text,
+    effective_date text,
+    voucher_type text,
+    voucher_number text,
+    reference text,
+    reference_date text,
+    narration text,
+    is_invoice integer,
+    is_optional integer,
+    place_of_supply text,
+    party_gstin text,
+    irn text,
+    irn_ack_no text,
+    irn_ack_date text,
+    company text,
+    master_id integer,
+    alter_id integer,
+    altered_on text,
+    party_name text,
+    party_mailing_name text,
+    state text,
+    country text,
+    pin_code text,
+    gst_registration text,
+    registration_type text,
+    voucher_number_series text,
+    order_reference text,
+    consignee_name text,
+    consignee_mailing_name text,
+    consignee_state text,
+    consignee_country text,
+    consignee_gstin text,
+    price_level text,
+    dispatch_from_name text,
+    dispatch_from_state text,
+    dispatch_from_pin text,
+    dispatch_doc_no text,
+    carrier_name text,
+    bill_of_landing_no text,
+    bill_of_landing_date text,
+    shipping_bill_no text,
+    shipping_bill_date text,
+    port_code text,
+    destination_country text,
+    cost_centre_name text,
+    dispatched_through text,
+    destination text
+);
+alter table trn_voucher enable row level security;
+create policy "authenticated_full_access" on trn_voucher
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_ledger_entries (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    ledger_name text,
+    amount numeric,
+    is_deemed_positive integer,
+    is_party_ledger integer,
+    ledger_type text,
+    ad_alloc_type text,
+    swift_code text
+);
+alter table trn_ledger_entries enable row level security;
+create policy "authenticated_full_access" on trn_ledger_entries
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_bill_allocations (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    ledger_name text,
+    bill_name text,
+    bill_type text,
+    amount numeric
+);
+alter table trn_bill_allocations enable row level security;
+create policy "authenticated_full_access" on trn_bill_allocations
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_inventory_entries (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    stock_item_name text,
+    actual_qty numeric,
+    billed_qty numeric,
+    rate numeric,
+    amount numeric,
+    is_deemed_positive integer,
+    discount numeric,
+    bom_name text,
+    is_scrap integer,
+    user_descriptions text
+);
+alter table trn_inventory_entries enable row level security;
+create policy "authenticated_full_access" on trn_inventory_entries
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_batch_allocations (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    stock_item_name text,
+    godown_name text,
+    batch_name text,
+    actual_qty numeric,
+    billed_qty numeric,
+    amount numeric,
+    manufactured_on text,
+    tracking_no text
+);
+alter table trn_batch_allocations enable row level security;
+create policy "authenticated_full_access" on trn_batch_allocations
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_inventory_ledgers (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    stock_item_name text,
+    ledger_name text,
+    amount numeric,
+    is_deemed_positive integer
+);
+alter table trn_inventory_ledgers enable row level security;
+create policy "authenticated_full_access" on trn_inventory_ledgers
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_inventory_entry_gst_rate_details (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    stock_item_name text,
+    duty_head text,
+    valuation_type text,
+    gst_rate numeric,
+    rate_per_unit numeric
+);
+alter table trn_inventory_entry_gst_rate_details enable row level security;
+create policy "authenticated_full_access" on trn_inventory_entry_gst_rate_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+create table if not exists trn_ledger_entry_gst_rate_details (
+    id bigserial primary key,
+    voucher_guid text references trn_voucher(guid) on delete cascade,
+    ledger_name text,
+    duty_head text,
+    valuation_type text,
+    gst_rate numeric,
+    rate_per_unit numeric
+);
+alter table trn_ledger_entry_gst_rate_details enable row level security;
+create policy "authenticated_full_access" on trn_ledger_entry_gst_rate_details
+  for all using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+
+-- ============================================================
+-- SECTION 13: AUTH USER SETUP
+-- Run this AFTER creating the user in Supabase Auth dashboard.
+-- Replace the email with your actual user's email.
+-- ============================================================
+
+update auth.users
+set raw_user_meta_data = raw_user_meta_data || '{"license_key": "TEST-LIC-0001-VALID"}'::jsonb
+where email = 'phantomdx9@gmail.com';
+
+-- ============================================================
+-- SECTION 14: VOUCHER QUEUE (PWA -> shell write bridge)
+-- PWA inserts pending rows here to create/alter Sales, Purchase,
+-- Receipt, Payment, or Journal vouchers. The shell polls this table
+-- (same polling pattern as SECTION 7's sync_commands) and writes
+-- the result back once Tally has processed it.
+-- ============================================================
+
+create table if not exists voucher_queue (
+  id                  uuid        primary key default gen_random_uuid(),
+  license_key         text        not null,
+  device_id           text        not null,
+  client_request_id   text        not null,
+  voucher_kind        text        not null,   -- 'Sales' | 'Purchase' | 'Receipt' | 'Payment' | 'Journal'
+  operation           text        not null,   -- 'Create' | 'Alter'
+  payload             jsonb       not null,
+  target_voucher_guid text,                   -- required when operation = 'Alter'
+  status              text        default 'pending',  -- 'pending' | 'processing' | 'posted' | 'failed' | 'conflict'
+  result              jsonb,
+  created_at          timestamptz default now(),
+  processed_at        timestamptz,
+  unique(client_request_id)
+);
+
+alter table voucher_queue enable row level security;
+
+-- Matches SECTION 7 (sync_commands) / SECTION 3 (sync_queue)'s existing house style —
+-- broad "authenticated_full_access" rather than a license_key/can_write-scoped policy.
+-- Tighter, company- and permission-scoped RLS is a documented future hardening step
+-- (see VOUCHER_PWA_BRIDGE_MASTERPLAN.md, Phase 46), not silently skipped here — flagging
+-- this explicitly rather than deviating from the existing convention without note.
+create policy "authenticated_full_access" on voucher_queue
+  for all to authenticated using (true) with check (true);
+
+-- Index for fast per-status, per-license polling (same purpose as SECTION 3's
+-- idx_sync_queue_device index).
+create index if not exists idx_voucher_queue_status
+  on voucher_queue(status, license_key);
+
+
+-- ============================================================
+-- DONE. All tables, RLS policies, indexes, and triggers created.
+-- ============================================================
