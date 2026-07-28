@@ -5,6 +5,8 @@ projects, provision their schema, onboard clients (login + license) without
 touching Supabase Studio, manage the client lifecycle (suspend/delete/move),
 and review a full audit trail of every action taken here.
 
+> Test comment: this change is intended to trigger a new Vercel deploy.
+
 See `ADMIN_PANEL_MASTERPLAN.md` for the full phase-by-phase build history and
 design rationale, and `docs/PHASE_N_SETUP.md` for the manual steps and
 verification notes specific to each phase.
